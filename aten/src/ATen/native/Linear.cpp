@@ -1,6 +1,8 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
 #include <ATen/native/Resize.h>
+#include <ATen/ExpandUtils.h>
+#include <ATen/native/mkldnn/MKLDNNCommon.h>
 #include <ATen/native/xnnpack/Engine.h>
 #include <ATen/WrapDimUtilsMulti.h>
 #include <ATen/TensorOperators.h>
@@ -62,7 +64,12 @@ static inline Tensor _flatten_nd_linear(const Tensor& input, const Tensor& weigh
       flattened_dim = flattened_dim * input_sizes[i];
     }
     auto inp_reshape = input.reshape_symint({flattened_dim, input_sizes.at(input_sizes.size() -1)});
-    const auto result = at::addmm(bias, inp_reshape, weight.t());
+    Tensor result;
+    if (weight.is_mkldnn()) {
+      result = at::addmm(bias, inp_reshape, weight);
+    } else {
+      result = at::addmm(bias, inp_reshape, weight.t());
+    }
     auto new_size = input_sizes.slice(0, input_sizes.size() - 1);
     c10::SymDimVector sizes_vec(new_size.begin(), new_size.end());
     sizes_vec.push_back(result.sym_size(1));
@@ -91,7 +98,35 @@ Tensor linear(const Tensor& input, const Tensor& weight, const std::optional<Ten
     return xnnpack::linear(input, weight, *bias);
   }
 #endif
-  if (input_dim == 2 && bias->defined()) {
+
+  // Weight has been prepacked
+  if (weight.is_mkldnn()) {
+    Tensor bias_ = *bias;
+
+    if (input_dim == 2) {
+      if (!(bias->defined())) {
+        bias_ =
+            at::zeros({input.sizes()[0], weight.sizes()[1]}, input.options());
+      }
+      return at::addmm(bias_, input, weight);
+    }
+
+    uint64_t flattened_dim = 1;
+    for (int64_t i = 0, ndim = input.sizes().size(); i < ndim - 1; ++i) {
+      flattened_dim = flattened_dim * input.sizes()[i];
+    }
+    if (!(bias->defined())) {
+      bias_ = at::zeros({flattened_dim, weight.sizes()[1]}, input.options());
+    }
+    if (!input.is_contiguous()) {
+      // If user forces flattening via env var
+      const Tensor input_cont = input.contiguous();
+      return _flatten_nd_linear(input_cont, weight, bias_);
+    }
+    return _flatten_nd_linear(input, weight, bias_);
+  }
+
+  if ((input_dim == 2 && bias->defined())) {
     // Fused op is marginally faster.
     return at::addmm(*bias, input, weight.t());
   }
@@ -137,6 +172,39 @@ Tensor& linear_out(const Tensor& input, const Tensor& weight, const std::optiona
     output.add_(*bias);
   }
   return output;
+}
+
+Tensor pack_linear(const Tensor& weight) {
+#if !defined(__aarch64__) || !AT_MKLDNN_ACL_ENABLED()
+  return weight
+#endif
+      const auto weight_dim = weight.dim();
+  TORCH_CHECK(
+      weight_dim != 0,
+      "weights need to be at least 1D, but they are ",
+      weight_dim,
+      "D");
+  ideep::matmul_forward_params params;
+  ideep::tensor input = itensor_view_from_dense(
+      at::zeros({weight.size(-1), weight.size(-1)}, weight.options()));
+  ideep::tensor weight_ = itensor_view_from_dense(weight.t());
+  ideep::tensor result = itensor_view_from_dense(
+      at::zeros({weight.size(-1), weight.size(-2)}, weight.options()));
+  ideep::matmul_forward::prepare(
+      params,
+      input,
+      weight_,
+      result,
+      1.0f,
+      1.0f,
+      ideep::attr_t(),
+      ideep::data_type::undef);
+
+  auto new_weights = weight_.reorder_if_differ_in(params.pd.weights_desc());
+  return new_with_itensor_mkldnn(
+      std::move(new_weights),
+      optTypeMetaToScalarType(weight.options().dtype_opt()),
+      weight.options().device_opt());
 }
 
 // sumproduct_pair computes `(left*right).sum(sumdims)` by means of permutation and

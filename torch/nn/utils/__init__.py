@@ -1,4 +1,4 @@
-from . import parametrizations, rnn, stateless
+from . import pack_linear, parametrizations, rnn, stateless
 from .clip_grad import clip_grad_norm, clip_grad_norm_, clip_grad_value_
 from .convert_parameters import parameters_to_vector, vector_to_parameters
 from .fusion import (
@@ -30,6 +30,7 @@ __all__ = [
     "parametrizations",
     "remove_spectral_norm",
     "remove_weight_norm",
+    "pack_linear",
     "rnn",
     "skip_init",
     "spectral_norm",
